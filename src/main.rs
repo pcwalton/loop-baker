@@ -644,11 +644,11 @@ impl<'a> PrimitiveProcessor<'a> {
 
         eprintln!("Rasterizing...");
         for i in 0..self.graph.faces.len() {
-            self.rasterize_triangle(i)
+            self.rasterize_triangle(args, i)
         }
     }
 
-    fn rasterize_triangle(&mut self, face_index: usize) {
+    fn rasterize_triangle(&mut self, args: &Args, face_index: usize) {
         let face = self.graph.faces[face_index];
         let info = self.face_info_for(face_index);
 
@@ -736,7 +736,7 @@ impl<'a> PrimitiveProcessor<'a> {
                 };
 
                 let st = Vector2::new(x as u32, y as u32);
-                self.emit_normal(&info, lambda, st, normal);
+                self.emit_normal(&info, lambda, st, normal, args.object_space);
             }
         }
     }
@@ -775,6 +775,7 @@ impl<'a> PrimitiveProcessor<'a> {
         lambda: Vector3<f32>,
         st: Vector2<u32>,
         normal: Vector3<f32>,
+        object_space: bool,
     ) {
         //println!("{:?}", normal);
         let original_lambda = bary_interp(
@@ -798,25 +799,27 @@ impl<'a> PrimitiveProcessor<'a> {
         )
         .normalize();
 
-        // Gram-Schmidt normalization
-        let tangent = original_tangent - original_normal.dot(&original_tangent) * original_normal;
-        let bitangent = original_normal.cross(&tangent).normalize();
+        let normal = if object_space {
+            Vector3::new(normal.x, -normal.z, normal.y)
+        } else {
+            // Gram-Schmidt normalization
+            let tangent =
+                original_tangent - original_normal.dot(&original_tangent) * original_normal;
+            let bitangent = original_normal.cross(&tangent).normalize();
 
-        /*
-        let tbn_normal = Vector3::new(
-            tangent.dot(&normal),
-            bitangent.dot(&normal),
-            original_normal.dot(&normal),
-        );
-        */
-        let tbn_normal = normal;
+            Vector3::new(
+                tangent.dot(&normal),
+                bitangent.dot(&normal),
+                original_normal.dot(&normal),
+            )
+        };
 
         self.normal_map.put_pixel(
             st,
             [
-                ((tbn_normal.x + 1.0) * 0.5 * 255.0).round() as u8,
-                ((-tbn_normal.z + 1.0) * 0.5 * 255.0).round() as u8,
-                ((tbn_normal.y + 1.0) * 0.5 * 255.0).round() as u8,
+                ((normal.x + 1.0) * 0.5 * 255.0).round() as u8,
+                ((normal.y + 1.0) * 0.5 * 255.0).round() as u8,
+                ((normal.z + 1.0) * 0.5 * 255.0).round() as u8,
             ],
         );
     }
