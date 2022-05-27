@@ -9,7 +9,7 @@ use gltf::accessor::Iter;
 use gltf::mesh::util::indices::{CastingIter as IndicesCastingIter, U32};
 use gltf::mesh::util::tex_coords::{CastingIter as TexCoordsCastingIter, F32};
 use gltf::mesh::Mode;
-use image::{GenericImageView, ImageFormat, Rgb, RgbImage};
+use image::{ImageFormat, Rgb, RgbImage};
 use nalgebra::{Matrix2, SMatrix, SVector, Vector2, Vector3};
 use once_cell::sync::Lazy;
 use ordered_float::OrderedFloat;
@@ -22,6 +22,7 @@ use std::mem;
 use std::ops::{Add, Mul};
 use std::path::{Path, PathBuf};
 
+// TODO(pcwalton): Make configurable.
 const MARGIN: u32 = 10;
 
 #[derive(Parser)]
@@ -42,6 +43,12 @@ struct Args {
         help = "Number of subdivisions to perform (higher = slower but higher quality)"
     )]
     subdivision_count: u32,
+    #[clap(
+        short = 'S',
+        long = "object-space",
+        help = "Emit an object-space normal map"
+    )]
+    object_space: bool,
     #[clap(
         short = 'd',
         long = "dump-subdivided-mesh",
@@ -116,6 +123,13 @@ impl RgbExt for Rgb<u8> {
     fn is_black(&self) -> bool {
         *self == Rgb([0, 0, 0])
     }
+}
+
+struct FaceInfo {
+    original_vertex_indices: [usize; 3],
+    original_normals: [Vector3<f32>; 3],
+    original_tangents: [Vector3<f32>; 3],
+    split_lambdas: [Vector3<f32>; 3],
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -635,25 +649,33 @@ impl<'a> PrimitiveProcessor<'a> {
     }
 
     fn rasterize_triangle(&mut self, face_index: usize) {
-        let face = &self.graph.faces[face_index];
-
-        let original_vertex_index_a = self.indices[face.original_face_index * 3 + 0] as usize;
-        let original_vertex_index_b = self.indices[face.original_face_index * 3 + 1] as usize;
-        let original_vertex_index_c = self.indices[face.original_face_index * 3 + 2] as usize;
-
-        let lambda_a = self.bary_for_split_vertex(face[0], face.original_face_index);
-        let lambda_b = self.bary_for_split_vertex(face[1], face.original_face_index);
-        let lambda_c = self.bary_for_split_vertex(face[2], face.original_face_index);
+        let face = self.graph.faces[face_index];
+        let info = self.face_info_for(face_index);
 
         let map_size = self.normal_map.texels.width() as f32;
 
-        let uv_original_a = Vector2::from(self.tex_coords[original_vertex_index_a]);
-        let uv_original_b = Vector2::from(self.tex_coords[original_vertex_index_b]);
-        let uv_original_c = Vector2::from(self.tex_coords[original_vertex_index_c]);
+        let uv_original_a = Vector2::from(self.tex_coords[info.original_vertex_indices[0]]);
+        let uv_original_b = Vector2::from(self.tex_coords[info.original_vertex_indices[1]]);
+        let uv_original_c = Vector2::from(self.tex_coords[info.original_vertex_indices[2]]);
 
-        let uv_a = bary_interp(uv_original_a, uv_original_b, uv_original_c, lambda_a) * map_size;
-        let uv_b = bary_interp(uv_original_a, uv_original_b, uv_original_c, lambda_b) * map_size;
-        let uv_c = bary_interp(uv_original_a, uv_original_b, uv_original_c, lambda_c) * map_size;
+        let uv_a = bary_interp(
+            uv_original_a,
+            uv_original_b,
+            uv_original_c,
+            info.split_lambdas[0],
+        ) * map_size;
+        let uv_b = bary_interp(
+            uv_original_a,
+            uv_original_b,
+            uv_original_c,
+            info.split_lambdas[1],
+        ) * map_size;
+        let uv_c = bary_interp(
+            uv_original_a,
+            uv_original_b,
+            uv_original_c,
+            info.split_lambdas[2],
+        ) * map_size;
 
         //println!("{:?} {:?} {:?} {:?} {:?} {:?}", uv_a, uv_b, uv_c, lambda_a, lambda_b, lambda_c);
 
@@ -677,14 +699,6 @@ impl<'a> PrimitiveProcessor<'a> {
             return;
         }
 
-        let original_normal_a = self.original_normals[original_vertex_index_a];
-        let original_normal_b = self.original_normals[original_vertex_index_b];
-        let original_normal_c = self.original_normals[original_vertex_index_c];
-
-        let original_tangent_a = self.original_tangents[original_vertex_index_a];
-        let original_tangent_b = self.original_tangents[original_vertex_index_b];
-        let original_tangent_c = self.original_tangents[original_vertex_index_c];
-
         for y in (min_bounds.y as i32)..(max_bounds.y as i32) {
             for x in (min_bounds.x as i32)..(max_bounds.x as i32) {
                 // Convert to barycentric coordinates.
@@ -703,7 +717,7 @@ impl<'a> PrimitiveProcessor<'a> {
 
                 let normal_a = self.refined_normals[face[0].index()];
 
-                let normal = match self.graph.limit_surface_normal(face, lambda) {
+                let normal = match self.graph.limit_surface_normal(&face, lambda) {
                     Some(mut normal) => {
                         // FIXME(pcwalton): Kind of ugly...
                         if normal.dot(&normal_a) < 0.0 {
@@ -721,48 +735,90 @@ impl<'a> PrimitiveProcessor<'a> {
                     }
                 };
 
-                //println!("{:?}", normal);
-                let original_lambda = bary_interp(lambda_a, lambda_b, lambda_c, lambda);
-                let original_normal = bary_interp(
-                    original_normal_a,
-                    original_normal_b,
-                    original_normal_c,
-                    original_lambda,
-                )
-                .normalize();
-                let original_tangent = bary_interp(
-                    original_tangent_a,
-                    original_tangent_b,
-                    original_tangent_c,
-                    original_lambda,
-                )
-                .normalize();
-
-                // Gram-Schmidt normalization
-                let tangent =
-                    original_tangent - original_normal.dot(&original_tangent) * original_normal;
-                let bitangent = original_normal.cross(&tangent).normalize();
-
-                /*
-                let tbn_normal = Vector3::new(
-                    tangent.dot(&normal),
-                    bitangent.dot(&normal),
-                    original_normal.dot(&normal),
-                );
-                */
-                let tbn_normal = normal;
-
                 let st = Vector2::new(x as u32, y as u32);
-                self.normal_map.put_pixel(
-                    st,
-                    [
-                        ((tbn_normal.x + 1.0) * 0.5 * 255.0).round() as u8,
-                        ((-tbn_normal.z + 1.0) * 0.5 * 255.0).round() as u8,
-                        ((tbn_normal.y + 1.0) * 0.5 * 255.0).round() as u8,
-                    ],
-                );
+                self.emit_normal(&info, lambda, st, normal);
             }
         }
+    }
+
+    fn face_info_for(&self, face_index: usize) -> FaceInfo {
+        let face = self.graph.faces[face_index];
+        let original_vertex_indices = [
+            self.indices[face.original_face_index * 3 + 0] as usize,
+            self.indices[face.original_face_index * 3 + 1] as usize,
+            self.indices[face.original_face_index * 3 + 2] as usize,
+        ];
+
+        FaceInfo {
+            original_vertex_indices,
+            original_normals: [
+                self.original_normals[original_vertex_indices[0]],
+                self.original_normals[original_vertex_indices[1]],
+                self.original_normals[original_vertex_indices[2]],
+            ],
+            original_tangents: [
+                self.original_tangents[original_vertex_indices[0]],
+                self.original_tangents[original_vertex_indices[1]],
+                self.original_tangents[original_vertex_indices[2]],
+            ],
+            split_lambdas: [
+                self.bary_for_split_vertex(face[0], face.original_face_index),
+                self.bary_for_split_vertex(face[1], face.original_face_index),
+                self.bary_for_split_vertex(face[2], face.original_face_index),
+            ],
+        }
+    }
+
+    fn emit_normal(
+        &mut self,
+        info: &FaceInfo,
+        lambda: Vector3<f32>,
+        st: Vector2<u32>,
+        normal: Vector3<f32>,
+    ) {
+        //println!("{:?}", normal);
+        let original_lambda = bary_interp(
+            info.split_lambdas[0],
+            info.split_lambdas[1],
+            info.split_lambdas[2],
+            lambda,
+        );
+        let original_normal = bary_interp(
+            info.original_normals[0],
+            info.original_normals[1],
+            info.original_normals[2],
+            original_lambda,
+        )
+        .normalize();
+        let original_tangent = bary_interp(
+            info.original_tangents[0],
+            info.original_tangents[1],
+            info.original_tangents[2],
+            original_lambda,
+        )
+        .normalize();
+
+        // Gram-Schmidt normalization
+        let tangent = original_tangent - original_normal.dot(&original_tangent) * original_normal;
+        let bitangent = original_normal.cross(&tangent).normalize();
+
+        /*
+        let tbn_normal = Vector3::new(
+            tangent.dot(&normal),
+            bitangent.dot(&normal),
+            original_normal.dot(&normal),
+        );
+        */
+        let tbn_normal = normal;
+
+        self.normal_map.put_pixel(
+            st,
+            [
+                ((tbn_normal.x + 1.0) * 0.5 * 255.0).round() as u8,
+                ((-tbn_normal.z + 1.0) * 0.5 * 255.0).round() as u8,
+                ((tbn_normal.y + 1.0) * 0.5 * 255.0).round() as u8,
+            ],
+        );
     }
 
     fn bary_for_split_vertex(
