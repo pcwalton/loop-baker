@@ -1,7 +1,5 @@
 // loop-baker/src/main.rs
 
-#![feature(let_else)]
-
 use clap::Parser;
 use derive_more::Index;
 use fxhash::FxHashMap;
@@ -9,6 +7,7 @@ use gltf::accessor::Iter;
 use gltf::mesh::util::indices::{CastingIter as IndicesCastingIter, U32};
 use gltf::mesh::util::tex_coords::{CastingIter as TexCoordsCastingIter, F32};
 use gltf::mesh::Mode;
+use gltf::{Mesh, Primitive};
 use image::{ImageFormat, Rgb, RgbImage};
 use indicatif::{ProgressBar, ProgressStyle};
 use nalgebra::{Matrix2, SMatrix, SVector, Vector2, Vector3};
@@ -66,11 +65,13 @@ struct Args {
 
 struct NormalMap {
     texels: RgbImage,
+    name: String,
 }
 
 impl NormalMap {
-    fn new(size: u32) -> NormalMap {
+    fn new(name: String, size: u32) -> NormalMap {
         NormalMap {
+            name,
             texels: RgbImage::new(size, size),
         }
     }
@@ -85,42 +86,39 @@ impl NormalMap {
             .unwrap();
     }
 
-    fn create_margins(&mut self, margin_size: u32, progress: &mut ProgressBar) {
+    fn inflate_margin(&mut self) {
         // TODO(pcwalton): This is really slow!
         let mut dest = RgbImage::new(self.texels.width(), self.texels.height());
-        for _ in 0..margin_size {
-            for y in 0..(self.texels.height() as i32) {
-                for x in 0..(self.texels.width() as i32) {
-                    let dest_texel = self.texels.get_pixel(x as u32, y as u32);
-                    let mut color = *dest_texel;
-                    if dest_texel.is_black() {
-                        'outer: for offset_y in (-1)..=1 {
-                            for offset_x in (-1)..=1 {
-                                if offset_y == 0 && offset_x == 0 {
-                                    continue;
-                                }
-                                if let (Ok(dest_x), Ok(dest_y)) =
-                                    ((x + offset_x).try_into(), (y + offset_y).try_into())
+        for y in 0..(self.texels.height() as i32) {
+            for x in 0..(self.texels.width() as i32) {
+                let dest_texel = self.texels.get_pixel(x as u32, y as u32);
+                let mut color = *dest_texel;
+                if dest_texel.is_black() {
+                    'outer: for offset_y in (-1)..=1 {
+                        for offset_x in (-1)..=1 {
+                            if offset_y == 0 && offset_x == 0 {
+                                continue;
+                            }
+                            if let (Ok(dest_x), Ok(dest_y)) =
+                                ((x + offset_x).try_into(), (y + offset_y).try_into())
+                            {
+                                if let Some(src_texel) =
+                                    self.texels.get_pixel_checked(dest_x, dest_y)
                                 {
-                                    if let Some(src_texel) =
-                                        self.texels.get_pixel_checked(dest_x, dest_y)
-                                    {
-                                        if !src_texel.is_black() {
-                                            color = *src_texel;
-                                            break 'outer;
-                                        }
+                                    if !src_texel.is_black() {
+                                        color = *src_texel;
+                                        break 'outer;
                                     }
                                 }
                             }
                         }
                     }
-                    dest.put_pixel(x as u32, y as u32, color);
                 }
+                dest.put_pixel(x as u32, y as u32, color);
             }
-
-            mem::swap(&mut dest, &mut self.texels);
-            progress.inc(1);
         }
+
+        mem::swap(&mut dest, &mut self.texels);
     }
 }
 
@@ -231,16 +229,19 @@ impl MeshGraph {
 
         let (v1, v2, v3) = (face[0], face[1], face[2]);
 
-        let v10 = self.node_across_from(v1, v2, v3).unwrap();
-        let v4 = self.node_across_from(v2, v3, v1).unwrap();
-        let v7 = self.node_across_from(v3, v1, v2).unwrap();
+        // These should always succeed for manifold meshes, but alas, not all meshes in the wild
+        // are manifold.
 
-        let v9 = self.node_across_from(v1, v10, v2).unwrap();
-        let v8 = self.node_across_from(v1, v7, v3).unwrap();
-        let v11 = self.node_across_from(v2, v10, v1).unwrap();
-        let v12 = self.node_across_from(v2, v4, v3).unwrap();
-        let v6 = self.node_across_from(v3, v7, v1).unwrap();
-        let v5 = self.node_across_from(v3, v4, v2).unwrap();
+        let v10 = self.node_across_from(v1, v2, v3)?;
+        let v4 = self.node_across_from(v2, v3, v1)?;
+        let v7 = self.node_across_from(v3, v1, v2)?;
+
+        let v9 = self.node_across_from(v1, v10, v2)?;
+        let v8 = self.node_across_from(v1, v7, v3)?;
+        let v11 = self.node_across_from(v2, v10, v1)?;
+        let v12 = self.node_across_from(v2, v4, v3)?;
+        let v6 = self.node_across_from(v3, v7, v1)?;
+        let v5 = self.node_across_from(v3, v4, v2)?;
 
         let (v, w) = (lambda.y, lambda.z);
         let dv: SVector<f32, 15> = SVector::from_column_slice(&[
@@ -658,8 +659,8 @@ impl<'a> PrimitiveProcessor<'a> {
         for i in 0..self.graph.faces.len() {
             self.rasterize_triangle(args, i);
 
-            let new_progress_position =
-                i as u64 * PROGRESS_TICKS_PER_MESH_PRIMITIVE / self.graph.faces.len() as u64;
+            let new_progress_position = progress_start
+                + i as u64 * PROGRESS_TICKS_PER_MESH_PRIMITIVE / self.graph.faces.len() as u64;
             if new_progress_position != progress.position() {
                 progress.set_position(new_progress_position);
             }
@@ -722,9 +723,10 @@ impl<'a> PrimitiveProcessor<'a> {
             for x in (min_bounds.x as i32)..(max_bounds.x as i32) {
                 // Convert to barycentric coordinates.
                 let p = Vector2::new(x as f32 + 0.5, y as f32 + 0.5);
-                let Some(barycentric_transform) =
-                    Matrix2::from_columns(&[uv_a - uv_c, uv_b - uv_c]).try_inverse() else {
-                        continue
+                let barycentric_transform =
+                    match Matrix2::from_columns(&[uv_a - uv_c, uv_b - uv_c]).try_inverse() {
+                        Some(barycentric_transform) => barycentric_transform,
+                        None => continue,
                     };
                 let lambda = barycentric_transform * (p - uv_c);
                 let lambda = lambda.insert_row(2, 1.0 - lambda.x - lambda.y);
@@ -909,6 +911,20 @@ impl<'a> PrimitiveProcessor<'a> {
     }
 }
 
+fn note_primitive_skipped(
+    progress: &mut ProgressBar,
+    mesh: &Mesh,
+    primitive: &Primitive,
+    why: &str,
+) {
+    progress.println(&format!(
+        "note: primitive {:?} skipped for mesh {:?} because {}",
+        primitive.index(),
+        mesh.name(),
+        why
+    ));
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -927,13 +943,13 @@ fn main() {
     let mut progress = ProgressBar::new(progress_length);
     progress.set_style(ProgressStyle::default_bar().template("{wide_bar} {percent}%"));
 
+    let mut normal_maps = FxHashMap::default();
+
     for (mesh_index, mesh) in gltf.meshes().enumerate() {
         let mesh_name = match mesh.name() {
             Some(name) => name.to_owned(),
             None => format!("{}", mesh_index),
         };
-
-        let mut normal_map = NormalMap::new(args.size);
 
         for (primitive_index, primitive) in mesh.primitives().enumerate() {
             progress.println(&format!(
@@ -941,47 +957,91 @@ fn main() {
                 primitive_index, mesh_name
             ));
 
+            let mut normal_map = match primitive
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture()
+            {
+                None => {
+                    note_primitive_skipped(
+                        &mut progress,
+                        &mesh,
+                        &primitive,
+                        "its material doesn't have a base color texture",
+                    );
+                    continue;
+                }
+                Some(texture_info) => {
+                    let texture = texture_info.texture();
+                    normal_maps.entry(texture.index()).or_insert_with(|| {
+                        let name = match texture.name() {
+                            Some(name) => name.to_owned(),
+                            None => format!("{}", texture.index()),
+                        };
+                        NormalMap::new(name, args.size)
+                    })
+                }
+            };
+
             let reader =
                 primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &*data.0));
             if primitive.mode() != Mode::Triangles {
-                eprintln!(
-                    "note: primitive {:?} skipped for mesh {:?} because it's rendering {:?}, \
-                         not triangles",
-                    primitive_index,
-                    mesh.name(),
-                    primitive.mode()
+                note_primitive_skipped(
+                    &mut progress,
+                    &mesh,
+                    &primitive,
+                    &format!("it's composed of {:?}, not triangles", primitive.mode()),
                 );
                 continue;
             }
-            let Some(positions) = reader.read_positions() else {
-                    eprintln!(
-                        "note: primitive {:?} skipped for mesh {:?} because it's missing positions",
-                        primitive_index,
-                        mesh_name);
-                    continue
-                };
-            let Some(normals) = reader.read_normals() else {
-                    eprintln!(
-                        "note: primitive {:?} skipped for mesh {:?} because it's missing normals",
-                        primitive_index,
-                        mesh_name);
-                    continue
-                };
-            let Some(tex_coords) = reader.read_tex_coords(0) else {
-                    eprintln!(
-                        "note: primitive {:?} skipped for mesh {:?} because it's missing texture \
-                         coordinates (UVs) 0",
-                        primitive_index,
-                        mesh_name);
-                    continue
-                };
-            let Some(indices) = reader.read_indices() else {
-                    eprintln!(
-                        "note: primitive {:?} skipped for mesh {:?} because it's missing indices",
-                        primitive_index,
-                        mesh_name);
-                    continue
-                };
+            let positions = match reader.read_positions() {
+                Some(positions) => positions,
+                None => {
+                    note_primitive_skipped(
+                        &mut progress,
+                        &mesh,
+                        &primitive,
+                        "it's missing positions",
+                    );
+                    continue;
+                }
+            };
+            let normals = match reader.read_normals() {
+                Some(normals) => normals,
+                None => {
+                    note_primitive_skipped(
+                        &mut progress,
+                        &mesh,
+                        &primitive,
+                        "it's missing normals",
+                    );
+                    continue;
+                }
+            };
+            let tex_coords = match reader.read_tex_coords(0) {
+                Some(tex_coords) => tex_coords,
+                None => {
+                    note_primitive_skipped(
+                        &mut progress,
+                        &mesh,
+                        &primitive,
+                        "it's missing texture coordinates (UVs) 0",
+                    );
+                    continue;
+                }
+            };
+            let indices = match reader.read_indices() {
+                Some(indices) => indices,
+                None => {
+                    note_primitive_skipped(
+                        &mut progress,
+                        &mesh,
+                        &primitive,
+                        "it's missing indices",
+                    );
+                    continue;
+                }
+            };
 
             let mut processor = PrimitiveProcessor::new(
                 &mut normal_map,
@@ -996,12 +1056,22 @@ fn main() {
             progress.inc(1);
             processor.process(&args, &mut progress);
         }
-
-        progress.println("Creating margins...");
-        normal_map.create_margins(args.margin, &mut progress);
-
-        progress.println("Writing normal map...");
-        normal_map.write_to(&PathBuf::from(format!("normal-map-{}.png", mesh_name)));
-        progress.finish();
     }
+
+    progress.println("Creating margins...");
+    for _ in 0..args.margin {
+        for normal_map in normal_maps.values_mut() {
+            normal_map.inflate_margin();
+            progress.inc(1);
+        }
+    }
+
+    progress.println("Writing normal maps...");
+    for normal_map in normal_maps.values() {
+        normal_map.write_to(&PathBuf::from(format!(
+            "normal-map-{}.png",
+            normal_map.name
+        )));
+    }
+    progress.finish();
 }
