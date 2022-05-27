@@ -9,7 +9,7 @@ use gltf::accessor::Iter;
 use gltf::mesh::util::indices::{CastingIter as IndicesCastingIter, U32};
 use gltf::mesh::util::tex_coords::{CastingIter as TexCoordsCastingIter, F32};
 use gltf::mesh::Mode;
-use image::{ImageFormat, Rgb, RgbImage};
+use image::{GenericImageView, ImageFormat, Rgb, RgbImage};
 use nalgebra::{Matrix2, SMatrix, SVector, Vector2, Vector3};
 use once_cell::sync::Lazy;
 use ordered_float::OrderedFloat;
@@ -18,8 +18,11 @@ use petgraph::visit::{EdgeRef, IntoNodeReferences};
 use smallvec::SmallVec;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::mem;
 use std::ops::{Add, Mul};
 use std::path::{Path, PathBuf};
+
+const MARGIN: u32 = 10;
 
 #[derive(Parser)]
 struct Args {
@@ -39,6 +42,12 @@ struct Args {
         help = "Number of subdivisions to perform (higher = slower but higher quality)"
     )]
     subdivision_count: u32,
+    #[clap(
+        short = 'd',
+        long = "dump-subdivided-mesh",
+        help = "Dump subdivided mesh to `out.obj`"
+    )]
+    dump_subdivided_mesh: bool,
 }
 
 struct NormalMap {
@@ -60,6 +69,52 @@ impl NormalMap {
         self.texels
             .save_with_format(path, ImageFormat::Png)
             .unwrap();
+    }
+
+    fn create_margins(&mut self) {
+        // TODO(pcwalton): This is really slow!
+        let mut dest = RgbImage::new(self.texels.width(), self.texels.height());
+        for _ in 0..MARGIN {
+            for y in 0..(self.texels.height() as i32) {
+                for x in 0..(self.texels.width() as i32) {
+                    let dest_texel = self.texels.get_pixel(x as u32, y as u32);
+                    let mut color = *dest_texel;
+                    if dest_texel.is_black() {
+                        'outer: for offset_y in (-1)..=1 {
+                            for offset_x in (-1)..=1 {
+                                if offset_y == 0 && offset_x == 0 {
+                                    continue;
+                                }
+                                if let (Ok(dest_x), Ok(dest_y)) =
+                                    ((x + offset_x).try_into(), (y + offset_y).try_into())
+                                {
+                                    if let Some(src_texel) =
+                                        self.texels.get_pixel_checked(dest_x, dest_y)
+                                    {
+                                        if !src_texel.is_black() {
+                                            color = *src_texel;
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dest.put_pixel(x as u32, y as u32, color);
+                }
+            }
+            mem::swap(&mut dest, &mut self.texels);
+        }
+    }
+}
+
+trait RgbExt {
+    fn is_black(&self) -> bool;
+}
+
+impl RgbExt for Rgb<u8> {
+    fn is_black(&self) -> bool {
+        *self == Rgb([0, 0, 0])
     }
 }
 
@@ -401,33 +456,18 @@ impl MeshGraph {
             .unwrap();
         }
     }
-
-    fn compute_normals(&self) -> Vec<Vector3<f32>> {
-        let mut normals = vec![Vector3::zeros(); self.graph.node_count()];
-        for face in &self.faces {
-            let a = self.graph[face[0]].position;
-            let b = self.graph[face[1]].position;
-            let c = self.graph[face[2]].position;
-            let normal = (b - a).cross(&(c - a)).normalize();
-            for &node in &face.nodes {
-                normals[node.index()] += normal;
-            }
-        }
-        normals
-            .iter_mut()
-            .for_each(|normal| *normal = normal.normalize());
-        normals
-    }
 }
 
 struct PrimitiveProcessor<'a> {
     normal_map: &'a mut NormalMap,
-    original_normals: Vec<[f32; 3]>,
+    original_positions: Vec<Vector3<f32>>,
+    original_normals: Vec<Vector3<f32>>,
     tex_coords: Vec<[f32; 2]>,
     indices: Vec<u32>,
     graph: MeshGraph,
     duplicates: FxHashMap<NodeIndex, SmallVec<[NodeIndex; 2]>>,
     refined_normals: Vec<Vector3<f32>>,
+    original_tangents: Vec<Vector3<f32>>,
 }
 
 impl<'a> PrimitiveProcessor<'a> {
@@ -438,8 +478,12 @@ impl<'a> PrimitiveProcessor<'a> {
         tex_coords: TexCoordsCastingIter<F32>,
         indices: IndicesCastingIter<U32>,
     ) -> Self {
-        let positions: Vec<_> = positions.collect();
-        let normals = normals.collect();
+        let positions: Vec<_> = positions
+            .map(|slice| Vector3::from_column_slice(&slice))
+            .collect();
+        let normals = normals
+            .map(|slice| Vector3::from_column_slice(&slice))
+            .collect();
         let tex_coords = tex_coords.collect();
         let indices: Vec<_> = indices.collect();
 
@@ -449,7 +493,7 @@ impl<'a> PrimitiveProcessor<'a> {
         for i in 0..positions.len() {
             let node_index = graph.add_node(Vertex {
                 provenance: VertexProvenance::Original(i as u32),
-                position: Vector3::from_column_slice(&positions[i]),
+                position: positions[i],
             });
             assert_eq!(node_index.index(), i);
         }
@@ -466,7 +510,9 @@ impl<'a> PrimitiveProcessor<'a> {
 
         Self {
             normal_map,
+            original_positions: positions,
             original_normals: normals,
+            original_tangents: vec![],
             tex_coords,
             indices,
             graph: MeshGraph::new(graph, faces),
@@ -534,14 +580,53 @@ impl<'a> PrimitiveProcessor<'a> {
         }
     }
 
-    fn process(&mut self, subdivision_count: u32) {
+    fn compute_original_tangents(&mut self) {
+        let mut tangents: Vec<Vector3<f32>> = vec![Vector3::zeros(); self.original_positions.len()];
+
+        for face in &self.graph.faces {
+            let vertex_index_a = self.indices[face.original_face_index * 3 + 0] as usize;
+            let vertex_index_b = self.indices[face.original_face_index * 3 + 1] as usize;
+            let vertex_index_c = self.indices[face.original_face_index * 3 + 2] as usize;
+
+            let position_a = self.original_positions[vertex_index_a];
+            let position_b = self.original_positions[vertex_index_b];
+            let position_c = self.original_positions[vertex_index_c];
+
+            let uv_a = Vector2::from(self.tex_coords[vertex_index_a]);
+            let uv_b = Vector2::from(self.tex_coords[vertex_index_b]);
+            let uv_c = Vector2::from(self.tex_coords[vertex_index_c]);
+
+            let edge_vectors: SMatrix<_, 3, 2> =
+                SMatrix::from_columns(&[position_b - position_a, position_c - position_a]);
+            let uv_vectors: SMatrix<_, 2, 2> = SMatrix::from_columns(&[uv_b - uv_a, uv_c - uv_a]);
+            let tangent_bitangent =
+                edge_vectors * uv_vectors.try_inverse().unwrap_or(SMatrix::identity());
+            let tangent = tangent_bitangent.column(0).normalize();
+
+            tangents[vertex_index_a] += tangent;
+            tangents[vertex_index_b] += tangent;
+            tangents[vertex_index_c] += tangent;
+        }
+
+        tangents
+            .iter_mut()
+            .for_each(|tangent| *tangent = tangent.normalize());
+        self.original_tangents = tangents;
+    }
+
+    fn process(&mut self, args: &Args) {
         eprintln!("Subdividing...");
-        for _ in 0..subdivision_count {
+        for _ in 0..args.subdivision_count {
             self.graph.subdivide();
         }
 
+        if args.dump_subdivided_mesh {
+            eprintln!("Dumping subdivided mesh...");
+            self.graph.dump();
+        }
+
         eprintln!("Computing vertex normals...");
-        self.refined_normals = self.graph.compute_normals();
+        self.compute_normals();
 
         eprintln!("Rasterizing...");
         for i in 0..self.graph.faces.len() {
@@ -587,6 +672,19 @@ impl<'a> PrimitiveProcessor<'a> {
             )),
         );
 
+        // Early out for zero-area triangles.
+        if min_bounds.y == max_bounds.y || min_bounds.x == max_bounds.x {
+            return;
+        }
+
+        let original_normal_a = self.original_normals[original_vertex_index_a];
+        let original_normal_b = self.original_normals[original_vertex_index_b];
+        let original_normal_c = self.original_normals[original_vertex_index_c];
+
+        let original_tangent_a = self.original_tangents[original_vertex_index_a];
+        let original_tangent_b = self.original_tangents[original_vertex_index_b];
+        let original_tangent_c = self.original_tangents[original_vertex_index_c];
+
         for y in (min_bounds.y as i32)..(max_bounds.y as i32) {
             for x in (min_bounds.x as i32)..(max_bounds.x as i32) {
                 // Convert to barycentric coordinates.
@@ -603,30 +701,64 @@ impl<'a> PrimitiveProcessor<'a> {
                     continue;
                 }
 
+                let normal_a = self.refined_normals[face[0].index()];
+
                 let normal = match self.graph.limit_surface_normal(face, lambda) {
-                    Some(normal) => normal,
+                    Some(mut normal) => {
+                        // FIXME(pcwalton): Kind of ugly...
+                        if normal.dot(&normal_a) < 0.0 {
+                            normal = -normal;
+                        }
+                        normal
+                    }
                     None => {
                         // Fall back to linearly interpolating vertex normals.
                         // TODO: We could do better here, by increasing subdivision levels or else
                         // using Stam's eigenanalysis method.
-                        let normal_a = self.refined_normals[face[0].index()];
                         let normal_b = self.refined_normals[face[1].index()];
                         let normal_c = self.refined_normals[face[2].index()];
-                        bary_interp(normal_a, normal_b, normal_c, lambda)
+                        bary_interp(normal_a, normal_b, normal_c, lambda).normalize()
                     }
                 };
 
                 //println!("{:?}", normal);
+                let original_lambda = bary_interp(lambda_a, lambda_b, lambda_c, lambda);
+                let original_normal = bary_interp(
+                    original_normal_a,
+                    original_normal_b,
+                    original_normal_c,
+                    original_lambda,
+                )
+                .normalize();
+                let original_tangent = bary_interp(
+                    original_tangent_a,
+                    original_tangent_b,
+                    original_tangent_c,
+                    original_lambda,
+                )
+                .normalize();
 
-                // FIXME(pcwalton): This needs to be relative to the original interpolated surface
-                // normal!!!
+                // Gram-Schmidt normalization
+                let tangent =
+                    original_tangent - original_normal.dot(&original_tangent) * original_normal;
+                let bitangent = original_normal.cross(&tangent).normalize();
+
+                /*
+                let tbn_normal = Vector3::new(
+                    tangent.dot(&normal),
+                    bitangent.dot(&normal),
+                    original_normal.dot(&normal),
+                );
+                */
+                let tbn_normal = normal;
+
                 let st = Vector2::new(x as u32, y as u32);
                 self.normal_map.put_pixel(
                     st,
                     [
-                        ((normal.x + 1.0) * 0.5 * 255.0).round() as u8,
-                        ((normal.y + 1.0) * 0.5 * 255.0).round() as u8,
-                        ((-normal.z + 1.0) * 0.5 * 255.0).round() as u8,
+                        ((tbn_normal.x + 1.0) * 0.5 * 255.0).round() as u8,
+                        ((-tbn_normal.z + 1.0) * 0.5 * 255.0).round() as u8,
+                        ((tbn_normal.y + 1.0) * 0.5 * 255.0).round() as u8,
                     ],
                 );
             }
@@ -671,6 +803,31 @@ impl<'a> PrimitiveProcessor<'a> {
                 .bary_for_split_vertex(from, original_face_index)
                 .lerp(&self.bary_for_split_vertex(to, original_face_index), 0.5),
         }
+    }
+
+    fn compute_normals(&mut self) {
+        let mut normals = vec![Vector3::zeros(); self.graph.graph.node_count()];
+        for face in &self.graph.faces {
+            let a = self.graph.graph[face[0]].position;
+            let b = self.graph.graph[face[1]].position;
+            let c = self.graph.graph[face[2]].position;
+
+            let mut normal = (b - a).cross(&(c - a)).normalize();
+
+            let original_vertex = self.indices[face.original_face_index * 3];
+            if normal.dot(&self.original_normals[original_vertex as usize]) < 0.0 {
+                normal = -normal;
+            }
+
+            for &node in &face.nodes {
+                normals[node.index()] += normal;
+            }
+        }
+
+        normals
+            .iter_mut()
+            .for_each(|normal| *normal = normal.normalize());
+        self.refined_normals = normals;
     }
 }
 
@@ -736,9 +893,13 @@ fn main() {
                 tex_coords.into_f32(),
                 indices.into_u32(),
             );
+            processor.compute_original_tangents();
             processor.merge_duplicates();
-            processor.process(args.subdivision_count);
+            processor.process(&args);
         }
+
+        eprintln!("Creating margins...");
+        normal_map.create_margins();
 
         normal_map.write_to(&PathBuf::from(format!("normal-map-{}.png", mesh_name)));
     }
