@@ -10,6 +10,7 @@ use gltf::mesh::util::indices::{CastingIter as IndicesCastingIter, U32};
 use gltf::mesh::util::tex_coords::{CastingIter as TexCoordsCastingIter, F32};
 use gltf::mesh::Mode;
 use image::{ImageFormat, Rgb, RgbImage};
+use indicatif::{ProgressBar, ProgressStyle};
 use nalgebra::{Matrix2, SMatrix, SVector, Vector2, Vector3};
 use once_cell::sync::Lazy;
 use ordered_float::OrderedFloat;
@@ -22,8 +23,7 @@ use std::mem;
 use std::ops::{Add, Mul};
 use std::path::{Path, PathBuf};
 
-// TODO(pcwalton): Make configurable.
-const MARGIN: u32 = 10;
+const PROGRESS_TICKS_PER_MESH_PRIMITIVE: u64 = 100;
 
 #[derive(Parser)]
 struct Args {
@@ -55,6 +55,13 @@ struct Args {
         help = "Dump subdivided mesh to `out.obj`"
     )]
     dump_subdivided_mesh: bool,
+    #[clap(
+        short = 'm',
+        long = "margin",
+        default_value_t = 10,
+        help = "Size of margin in texels, to prevent bleed at seams"
+    )]
+    margin: u32,
 }
 
 struct NormalMap {
@@ -78,10 +85,10 @@ impl NormalMap {
             .unwrap();
     }
 
-    fn create_margins(&mut self) {
+    fn create_margins(&mut self, margin_size: u32, progress: &mut ProgressBar) {
         // TODO(pcwalton): This is really slow!
         let mut dest = RgbImage::new(self.texels.width(), self.texels.height());
-        for _ in 0..MARGIN {
+        for _ in 0..margin_size {
             for y in 0..(self.texels.height() as i32) {
                 for x in 0..(self.texels.width() as i32) {
                     let dest_texel = self.texels.get_pixel(x as u32, y as u32);
@@ -110,7 +117,9 @@ impl NormalMap {
                     dest.put_pixel(x as u32, y as u32, color);
                 }
             }
+
             mem::swap(&mut dest, &mut self.texels);
+            progress.inc(1);
         }
     }
 }
@@ -628,24 +637,34 @@ impl<'a> PrimitiveProcessor<'a> {
         self.original_tangents = tangents;
     }
 
-    fn process(&mut self, args: &Args) {
-        eprintln!("Subdividing...");
+    fn process(&mut self, args: &Args, progress: &mut ProgressBar) {
+        progress.println("Subdividing...");
         for _ in 0..args.subdivision_count {
             self.graph.subdivide();
+            progress.inc(1);
         }
 
         if args.dump_subdivided_mesh {
-            eprintln!("Dumping subdivided mesh...");
+            progress.println("Dumping subdivided mesh...");
             self.graph.dump();
         }
 
-        eprintln!("Computing vertex normals...");
+        progress.println("Computing vertex normals...");
         self.compute_normals();
+        progress.inc(1);
 
-        eprintln!("Rasterizing...");
+        progress.println(&format!("Rasterizing {} faces...", self.graph.faces.len()));
+        let progress_start = progress.position();
         for i in 0..self.graph.faces.len() {
-            self.rasterize_triangle(args, i)
+            self.rasterize_triangle(args, i);
+
+            let new_progress_position =
+                i as u64 * PROGRESS_TICKS_PER_MESH_PRIMITIVE / self.graph.faces.len() as u64;
+            if new_progress_position != progress.position() {
+                progress.set_position(new_progress_position);
+            }
         }
+        progress.set_position(progress_start + PROGRESS_TICKS_PER_MESH_PRIMITIVE);
     }
 
     fn rasterize_triangle(&mut self, args: &Args, face_index: usize) {
@@ -894,6 +913,20 @@ fn main() {
     let args = Args::parse();
 
     let (gltf, buffers, _) = gltf::import(&args.input).unwrap();
+
+    // Determine progress length.
+    let mut progress_length = 0;
+    for mesh in gltf.meshes() {
+        for _ in mesh.primitives() {
+            progress_length +=
+                1 + args.subdivision_count as u64 + 1 + PROGRESS_TICKS_PER_MESH_PRIMITIVE;
+        }
+    }
+    progress_length += args.margin as u64 + 1;
+
+    let mut progress = ProgressBar::new(progress_length);
+    progress.set_style(ProgressStyle::default_bar().template("{wide_bar} {percent}%"));
+
     for (mesh_index, mesh) in gltf.meshes().enumerate() {
         let mesh_name = match mesh.name() {
             Some(name) => name.to_owned(),
@@ -903,6 +936,11 @@ fn main() {
         let mut normal_map = NormalMap::new(args.size);
 
         for (primitive_index, primitive) in mesh.primitives().enumerate() {
+            progress.println(&format!(
+                "Reading primitive {} for mesh {:?}...",
+                primitive_index, mesh_name
+            ));
+
             let reader =
                 primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &*data.0));
             if primitive.mode() != Mode::Triangles {
@@ -954,12 +992,16 @@ fn main() {
             );
             processor.compute_original_tangents();
             processor.merge_duplicates();
-            processor.process(&args);
+
+            progress.inc(1);
+            processor.process(&args, &mut progress);
         }
 
-        eprintln!("Creating margins...");
-        normal_map.create_margins();
+        progress.println("Creating margins...");
+        normal_map.create_margins(args.margin, &mut progress);
 
+        progress.println("Writing normal map...");
         normal_map.write_to(&PathBuf::from(format!("normal-map-{}.png", mesh_name)));
+        progress.finish();
     }
 }
