@@ -8,9 +8,10 @@ use gltf::mesh::util::indices::{CastingIter as IndicesCastingIter, U32};
 use gltf::mesh::util::tex_coords::{CastingIter as TexCoordsCastingIter, F32};
 use gltf::mesh::Mode;
 use gltf::{Mesh, Primitive};
-use image::{ImageFormat, Rgb, RgbImage};
+use image::{EncodableLayout, ImageBuffer, Pixel, PixelWithColorType, Rgb};
 use indicatif::{ProgressBar, ProgressStyle};
-use nalgebra::{Matrix2, Matrix3x2, SMatrix, SVector, Vector2, Vector3};
+use nalgebra::{Matrix2, SMatrix, Vector2, Vector3};
+use num_traits::Zero;
 use once_cell::sync::Lazy;
 use ordered_float::OrderedFloat;
 use petgraph::graph::{EdgeIndex, NodeIndex, UnGraph};
@@ -63,32 +64,36 @@ struct Args {
     margin: u32,
 }
 
-struct NormalMap {
-    texels: RgbImage,
-    name: String,
+struct Texture<P>
+where
+    P: Pixel + PixelWithColorType,
+    [P::Subpixel]: EncodableLayout,
+{
+    texels: ImageBuffer<P, Vec<P::Subpixel>>,
 }
 
-impl NormalMap {
-    fn new(name: String, size: u32) -> NormalMap {
-        NormalMap {
-            name,
-            texels: RgbImage::new(size, size),
+impl<P> Texture<P>
+where
+    P: Pixel + PixelWithColorType,
+    [P::Subpixel]: EncodableLayout,
+{
+    fn new(size: u32) -> Texture<P> {
+        Texture {
+            texels: ImageBuffer::new(size, size),
         }
     }
 
-    fn put_pixel(&mut self, pos: Vector2<u32>, color: [u8; 3]) {
-        self.texels.put_pixel(pos.x, pos.y, Rgb(color))
+    fn put_pixel(&mut self, pos: Vector2<u32>, color: P) {
+        self.texels.put_pixel(pos.x, pos.y, color)
     }
 
     fn write_to(&self, path: &Path) {
-        self.texels
-            .save_with_format(path, ImageFormat::Png)
-            .unwrap();
+        self.texels.save(path).unwrap();
     }
 
     fn inflate_margin(&mut self) {
         // TODO(pcwalton): This is really slow!
-        let mut dest = RgbImage::new(self.texels.width(), self.texels.height());
+        let mut dest = ImageBuffer::new(self.texels.width(), self.texels.height());
         for y in 0..(self.texels.height() as i32) {
             for x in 0..(self.texels.width() as i32) {
                 let dest_texel = self.texels.get_pixel(x as u32, y as u32);
@@ -122,13 +127,34 @@ impl NormalMap {
     }
 }
 
-trait RgbExt {
+impl Texture<Rgb<u8>> {
+    fn put_unit_vector(&mut self, pos: Vector2<u32>, vector: Vector3<f32>) {
+        self.put_pixel(
+            pos,
+            Rgb([
+                ((vector.x + 1.0) * 0.5 * 255.0).round() as u8,
+                ((vector.y + 1.0) * 0.5 * 255.0).round() as u8,
+                ((vector.z + 1.0) * 0.5 * 255.0).round() as u8,
+            ]),
+        )
+    }
+}
+
+trait PixelExt {
     fn is_black(&self) -> bool;
 }
 
-impl RgbExt for Rgb<u8> {
+impl<P> PixelExt for P
+where
+    P: Pixel,
+{
     fn is_black(&self) -> bool {
-        *self == Rgb([0, 0, 0])
+        let mut is_black = true;
+        (*self).clone().apply(|subpixel| {
+            is_black = is_black && subpixel.is_zero();
+            subpixel
+        });
+        is_black
     }
 }
 
@@ -180,8 +206,6 @@ where
 
 #[derive(Clone, Copy)]
 struct Derivatives {
-    // Jacobian
-    d_p_d_lambda: Matrix3x2<f32>,
     normal: Vector3<f32>,
 }
 
@@ -309,10 +333,7 @@ impl MeshGraph {
         let d_p_d_lambda = weights * d_lambda;
         let normal = d_p_d_lambda.column(0).cross(&d_p_d_lambda.column(1));
 
-        Some(Derivatives {
-            d_p_d_lambda,
-            normal,
-        })
+        Some(Derivatives { normal })
     }
 
     fn node_across_from(
@@ -502,6 +523,20 @@ struct MeshData {
     normals: Vec<Vector3<f32>>,
     tex_coords: Vec<Vector2<f32>>,
     indices: Vec<u32>,
+}
+
+struct NormalMap {
+    texture: Texture<Rgb<u8>>,
+    name: String,
+}
+
+impl NormalMap {
+    fn new(name: String, size: u32) -> Self {
+        Self {
+            texture: Texture::new(size),
+            name,
+        }
+    }
 }
 
 struct PrimitiveProcessor<'a> {
@@ -699,7 +734,7 @@ impl<'a> PrimitiveProcessor<'a> {
         let face = self.graph.faces[face_index];
         let info = self.face_info_for(face_index);
 
-        let map_size = self.normal_map.texels.width() as f32;
+        let map_size = self.normal_map.texture.texels.width() as f32;
 
         let uv_original_a = self.original_data.tex_coords[info.original_vertex_indices[0]];
         let uv_original_b = self.original_data.tex_coords[info.original_vertex_indices[1]];
@@ -765,23 +800,13 @@ impl<'a> PrimitiveProcessor<'a> {
 
                 let normal_a = self.refined_normals[face[0].index()];
 
-                let (mut normal, tangent);
+                let mut normal;
                 match self.graph.limit_surface_derivatives(&face, lambda) {
                     Some(derivatives) => {
                         // FIXME(pcwalton): Kind of ugly...
                         normal = derivatives.normal.normalize();
                         if normal.dot(&normal_a) < 0.0 {
                             normal = -normal;
-                        }
-
-                        let d_uv_d_lambda = Matrix2::from_columns(&[uv_b - uv_a, uv_c - uv_a]);
-                        match d_uv_d_lambda.try_inverse() {
-                            Some(d_lambda_d_uv) => {
-                                // Chain rule:
-                                let d_p_d_uv = derivatives.d_p_d_lambda * d_lambda_d_uv;
-                                tangent = d_p_d_uv.column(0).into();
-                            }
-                            None => tangent = Vector3::zeros(),
                         }
                     }
                     None => {
@@ -791,7 +816,6 @@ impl<'a> PrimitiveProcessor<'a> {
                         let normal_b = self.refined_normals[face[1].index()];
                         let normal_c = self.refined_normals[face[2].index()];
                         normal = bary_interp(normal_a, normal_b, normal_c, lambda).normalize();
-                        tangent = Vector3::zeros();
                     }
                 };
 
@@ -880,14 +904,7 @@ impl<'a> PrimitiveProcessor<'a> {
             )
         };
 
-        self.normal_map.put_pixel(
-            st,
-            [
-                ((normal.x + 1.0) * 0.5 * 255.0).round() as u8,
-                ((normal.y + 1.0) * 0.5 * 255.0).round() as u8,
-                ((normal.z + 1.0) * 0.5 * 255.0).round() as u8,
-            ],
-        );
+        self.normal_map.texture.put_unit_vector(st, normal);
     }
 
     fn bary_for_split_vertex(
@@ -973,7 +990,7 @@ fn note_primitive_skipped(
 fn main() {
     let args = Args::parse();
 
-    let (mut gltf, buffers, _) = gltf::import(&args.input).unwrap();
+    let (gltf, buffers, _) = gltf::import(&args.input).unwrap();
 
     // Determine progress length.
     let mut progress_length = 0;
@@ -1106,14 +1123,14 @@ fn main() {
     progress.println("Creating margins...");
     for _ in 0..args.margin {
         for normal_map in normal_maps.values_mut() {
-            normal_map.inflate_margin();
+            normal_map.texture.inflate_margin();
             progress.inc(1);
         }
     }
 
     progress.println("Writing normal maps...");
     for normal_map in normal_maps.values() {
-        normal_map.write_to(&PathBuf::from(format!(
+        normal_map.texture.write_to(&PathBuf::from(format!(
             "normal-map-{}.png",
             normal_map.name
         )));
