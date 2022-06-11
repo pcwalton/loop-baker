@@ -197,6 +197,12 @@ impl Face {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Derivatives {
+    // NB: Not normalized.
+    normal: Vector3<f32>,
+}
+
 fn bary_interp<T>(a: T, b: T, c: T, lambda: Vector3<f32>) -> T
 where
     T: Add<Output = T> + Mul<f32, Output = T>,
@@ -204,9 +210,60 @@ where
     a * lambda.x + b * lambda.y + c * lambda.z
 }
 
-#[derive(Clone, Copy)]
-struct Derivatives {
-    normal: Vector3<f32>,
+fn eval_bezier_triangle_2(
+    p002: Vector3<f32>,
+    p011: Vector3<f32>,
+    p020: Vector3<f32>,
+    p101: Vector3<f32>,
+    p110: Vector3<f32>,
+    p200: Vector3<f32>,
+    lambda: Vector3<f32>,
+) -> Vector3<f32> {
+    let q010: Vector3<f32> = bary_interp(p110.into(), p020.into(), p011.into(), lambda);
+    let q001: Vector3<f32> = bary_interp(p101.into(), p011.into(), p002.into(), lambda);
+    let q100: Vector3<f32> = bary_interp(p200.into(), p110.into(), p101.into(), lambda);
+
+    bary_interp(q100, q010, q001, lambda)
+}
+
+fn eval_bezier_triangle_3(
+    p003: Vector3<f32>,
+    p012: Vector3<f32>,
+    p021: Vector3<f32>,
+    p030: Vector3<f32>,
+    p102: Vector3<f32>,
+    p111: Vector3<f32>,
+    p120: Vector3<f32>,
+    p201: Vector3<f32>,
+    p210: Vector3<f32>,
+    p300: Vector3<f32>,
+    lambda: Vector3<f32>,
+) -> Vector3<f32> {
+    let q020: Vector3<f32> = bary_interp(p120.into(), p030.into(), p021.into(), lambda);
+    let q011: Vector3<f32> = bary_interp(p111.into(), p021.into(), p012.into(), lambda);
+    let q110: Vector3<f32> = bary_interp(p210.into(), p120.into(), p111.into(), lambda);
+    let q002: Vector3<f32> = bary_interp(p102.into(), p012.into(), p003.into(), lambda);
+    let q101: Vector3<f32> = bary_interp(p201.into(), p111.into(), p102.into(), lambda);
+    let q200: Vector3<f32> = bary_interp(p300.into(), p210.into(), p201.into(), lambda);
+
+    eval_bezier_triangle_2(q002, q011, q020, q101, q110, q200, lambda)
+}
+
+fn eval_bezier_triangle_matrix_3(cp: &SMatrix<f32, 3, 10>, lambda: Vector3<f32>) -> Vector3<f32> {
+    let p003 = cp.column(0).into();
+    let p012 = cp.column(1).into();
+    let p021 = cp.column(2).into();
+    let p030 = cp.column(3).into();
+    let p102 = cp.column(4).into();
+    let p111 = cp.column(5).into();
+    let p120 = cp.column(6).into();
+    let p201 = cp.column(7).into();
+    let p210 = cp.column(8).into();
+    let p300 = cp.column(9).into();
+
+    eval_bezier_triangle_3(
+        p003, p012, p021, p030, p102, p111, p120, p201, p210, p300, lambda,
+    )
 }
 
 #[derive(Clone)]
@@ -228,22 +285,41 @@ impl MeshGraph {
 
     fn limit_surface_derivatives(&self, face: &Face, lambda: Vector3<f32>) -> Option<Derivatives> {
         #[rustfmt::skip]
-        static PHI: Lazy<SMatrix<f32, 12, 15>> = Lazy::new(|| {
-            let phi: SMatrix<f32, 12, 15> = SMatrix::from_row_slice(&[
-                6.,  0.,  0., -12., -12., -12.,  8.,  12.,  12.,  8., -1., -2.,  0., -2., -1.,
-                1.,  4.,  2.,   6.,   6.,   0., -4.,  -6., -12., -4., -1., -2.,  0.,  4.,  2.,
-                1.,  2.,  4.,   0.,   6.,   6., -4., -12.,  -6., -4.,  2.,  4.,  0., -2., -1.,
-                0.,  0.,  0.,   0.,   0.,   0.,  2.,   6.,   6.,  2., -1., -2.,  0., -2., -1.,
-                0.,  0.,  0.,   0.,   0.,   0.,  0.,   0.,   0.,  0.,  0.,  0.,  0.,  2.,  1.,
-                0.,  0.,  0.,   0.,   0.,   0.,  0.,   0.,   0.,  2.,  0.,  0.,  0., -2., -1.,
-                1., -2.,  2.,   0.,  -6.,   0.,  2.,   6.,   0., -4., -1., -2.,  0.,  4.,  2.,
-                1., -4., -2.,   6.,   6.,   0., -4.,  -6.,   0.,  2.,  1.,  2.,  0., -2., -1.,
-                1., -2., -4.,   0.,   6.,   6.,  2.,   0.,  -6., -4., -1., -2.,  0.,  2.,  1.,
-                1.,  2., -2.,   0.,  -6.,   0., -4.,   0.,   6.,  2.,  2.,  4.,  0., -2., -1.,
-                0.,  0.,  0.,   0.,   0.,   0.,  2.,   0.,   0.,  0., -1., -2.,  0.,  0.,  0.,
-                0.,  0.,  0.,   0.,   0.,   0.,  0.,   0.,   0.,  0.,  1.,  2.,  0.,  0.,  0.,
+        static M_D_LAMBDA_1: Lazy<SMatrix<f32, 12, 10>> = Lazy::new(|| {
+            let m_d_lambda_1: SMatrix<f32, 12, 10> = SMatrix::from_row_slice(&[
+                -1.0, -2.0, -3.0, -2.0, -2.0, -4.0, -4.0, -2.0, -4.0,  0.0,
+                 1.0,  2.0,  2.0,  0.0,  2.0,  4.0,  4.0,  3.0,  4.0,  2.0,
+                 0.0, -2.0, -2.0, -1.0,  2.0,  0.0, -1.0,  2.0,  1.0,  1.0,
+                 2.0,  3.0,  2.0,  1.0,  1.0,  1.0,  1.0,  0.0,  0.0,  0.0,
+                 1.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                -1.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                -2.0, -1.0,  0.0,  0.0, -3.0, -1.0,  0.0, -2.0, -1.0, -1.0,
+                 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, -1.0,  0.0, -2.0,
+                 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, -1.0, -1.0,
+                 0.0,  0.0,  0.0, -1.0,  0.0,  0.0, -1.0,  0.0,  1.0,  1.0,
+                 0.0,  0.0,  0.0,  1.0,  0.0,  0.0,  1.0,  0.0,  0.0,  0.0,
+                 0.0,  0.0,  1.0,  2.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
             ]);
-            phi.scale(1.0 / 12.0)
+            m_d_lambda_1.scale(1.0 / 6.0)
+        });
+
+        #[rustfmt::skip]
+        static M_D_LAMBDA_2: Lazy<SMatrix<f32, 12, 10>> = Lazy::new(|| {
+            let m_d_lambda_2: SMatrix<f32, 12, 10> = SMatrix::from_row_slice(&[
+                -2.0, -3.0, -2.0, -1.0, -4.0, -4.0, -2.0, -4.0, -2.0,  0.0,
+                -1.0, -2.0, -2.0,  0.0, -1.0,  0.0,  2.0,  1.0,  2.0,  1.0,
+                 0.0,  2.0,  2.0,  1.0,  4.0,  4.0,  2.0,  4.0,  3.0,  2.0,
+                 1.0,  2.0,  3.0,  2.0,  1.0,  1.0,  1.0,  0.0,  0.0,  0.0,
+                 2.0,  1.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                 1.0,  0.0,  0.0,  0.0,  1.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                -1.0,  0.0,  0.0,  0.0, -1.0,  0.0,  0.0,  1.0,  0.0,  1.0,
+                 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, -1.0,  0.0, -1.0,
+                 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0, -1.0, -2.0,
+                 0.0,  0.0, -1.0, -2.0,  0.0, -1.0, -3.0, -1.0, -2.0, -1.0,
+                 0.0,  0.0,  0.0, -1.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                 0.0,  0.0,  0.0,  1.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+            ]);
+            m_d_lambda_2.scale(1.0 / 6.0)
         });
 
         if !self.face_is_regular(face) {
@@ -274,46 +350,6 @@ impl MeshGraph {
         let v6 = self.node_across_from(v3, v7, v1)?;
         let v5 = self.node_across_from(v3, v4, v2)?;
 
-        // FIXME(pcwalton): This may be numerically unstable.
-        // I might prefer to write this as a Bezier surface and then evaluate using
-        // generalized de Casteljau subdivision.
-
-        let (lambda1, lambda2) = (lambda.y, lambda.z);
-        let d_lambda: SMatrix<f32, 15, 2> = SMatrix::from_column_slice(&[
-            // dλ₁:
-            0.0,
-            1.0,
-            0.0,
-            2.0 * lambda1,
-            lambda2,
-            0.0,
-            3.0 * lambda1 * lambda1,
-            2.0 * lambda1 * lambda2,
-            lambda2 * lambda2,
-            0.0,
-            4.0 * lambda1 * lambda1 * lambda1,
-            3.0 * lambda1 * lambda1 * lambda2,
-            2.0 * lambda1 * lambda2 * lambda2,
-            lambda2 * lambda2 * lambda2,
-            0.0,
-            // dλ₂:
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            lambda1,
-            2.0 * lambda2,
-            0.0,
-            lambda1 * lambda2,
-            2.0 * lambda1 * lambda2,
-            3.0 * lambda2 * lambda2 * lambda2,
-            0.0,
-            lambda1 * lambda1 * lambda1,
-            2.0 * lambda1 * lambda1 * lambda2,
-            3.0 * lambda1 * lambda2 * lambda2,
-            4.0 * lambda2 * lambda2 * lambda2,
-        ]);
-
         let x: SMatrix<f32, 3, 12> = SMatrix::from_columns(&[
             self.graph[v1].position,
             self.graph[v2].position,
@@ -329,9 +365,12 @@ impl MeshGraph {
             self.graph[v12].position,
         ]);
 
-        let weights = x * *PHI;
-        let d_p_d_lambda = weights * d_lambda;
-        let normal = d_p_d_lambda.column(0).cross(&d_p_d_lambda.column(1));
+        // Use generalized de Casteljau subdivision to evaluate the normal for numerical stability.
+        let (d_lambda1_cp, d_lambda2_cp) = (x * *M_D_LAMBDA_1, x * *M_D_LAMBDA_2);
+        let d_lambda1 = eval_bezier_triangle_matrix_3(&d_lambda1_cp, lambda);
+        let d_lambda2 = eval_bezier_triangle_matrix_3(&d_lambda2_cp, lambda);
+
+        let normal = d_lambda1.cross(&d_lambda2);
 
         Some(Derivatives { normal })
     }
